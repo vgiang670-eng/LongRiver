@@ -74,12 +74,14 @@ class ProductionGuardMonitor:
         self.guard_in_roi = True
         self.last_person_boxes = []
 
-        # Ngưỡng tin cậy (Confidence) chuẩn hóa để chống báo động giả
+        # Ngưỡng tin cậy (Confidence) chuẩn hóa để chống báo động giả:
+        # Thẻ tên/ví/vật chữ nhật chỉ đạt conf ~0.35-0.45 -> Lọc bỏ hoàn toàn
+        # Điện thoại thật khi dùng sẽ đạt conf >= 0.50 - 0.85 -> Nhận diện chuẩn xác
         self.conf_thresholds = {
             0: 0.35,  # Hút thuốc: >= 0.35
-            1: 0.50,  # Ăn uống: nâng lên 0.50 (tránh nhầm khi đưa tay/cầm điện thoại gần mặt)
+            1: 0.55,  # Ăn uống: >= 0.55 (chống nhầm khi cầm thẻ/bút gần mặt)
             2: 0.40,  # Ngủ gật: >= 0.40
-            3: 0.35   # Điện thoại: >= 0.35
+            3: 0.50   # Điện thoại: nâng lên 0.50 (lọc bỏ triệt để thẻ tên, ví, vật hình chữ nhật)
         }
 
         # Cấu hình nhãn và màu sắc
