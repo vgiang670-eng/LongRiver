@@ -19,3 +19,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 push_to_github.bat
+
+# OpenVINO cache & exported models
+kernel.errors.txt
+*_openvino_model/
+
