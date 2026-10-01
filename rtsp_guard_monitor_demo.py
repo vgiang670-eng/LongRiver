@@ -1,17 +1,17 @@
 """
 HỆ THỐNG GIÁM SÁT HÀNH VI BẢO VỆ CHUẨN THỰC TẾ (PRODUCTION GRADE)
-Áp dụng:
-1. Độ phân giải chuẩn imgsz=640 để giữ nguyên chi tiết điếu thuốc siêu nhỏ
-2. Bộ lọc tích lũy thời gian (Temporal Voting / Accumulator) chống chập chờn
-3. Bắt cả cử chỉ tay đưa lên miệng (kết hợp nhãn smoking + eating)
-4. Tự động nhận diện có mặt tại chốt trực (ROI) và cảnh báo bỏ vị trí
+Bao gồm:
+1. Hút thuốc (Smoking)
+2. Sử dụng điện thoại (Phone usage)
+3. Ngủ gật (Sleeping)
+4. Ăn uống trong giờ trực (Eating)
+5. Bỏ vị trí trực (Leaving guard post - Zone ROI & Timer)
 """
 
 import cv2
 import numpy as np
 import time
 import os
-from collections import deque
 from ultralytics import YOLO
 
 class ProductionGuardMonitor:
@@ -27,23 +27,27 @@ class ProductionGuardMonitor:
         self.last_seen_in_post_time = time.time()
         self.roi_polygon = roi_polygon
         
-        # Bộ đệm tích lũy 10 frames gần nhất để chống rớt frame (Rolling Window)
-        self.history_len = 10
-        self.smoking_history = deque(maxlen=self.history_len)
-        self.phone_history = deque(maxlen=self.history_len)
-        self.sleeping_history = deque(maxlen=self.history_len)
-        
-        # Thời điểm cảnh báo lần cuối
-        self.alert_until = {
-            'smoking': 0,
-            'phone': 0,
-            'sleeping': 0,
-            'absence': 0
+        # Lưu thời điểm cuối cùng nhìn thấy từng hành vi
+        self.last_seen_time = {
+            'smoking': 0.0,
+            'phone': 0.0,
+            'sleeping': 0.0,
+            'eating': 0.0
         }
+        # Thời gian giữ cảnh báo sau khi hết hành vi (2.0s rồi tắt ngay, không bị dính)
+        self.alert_duration = 2.0
 
         self.frame_count = 0
         self.guard_in_roi = True
         self.last_person_boxes = []
+
+        # Cấu hình nhãn và màu sắc
+        self.behavior_config = {
+            0: {'key': 'smoking', 'name': 'HUT THUOC', 'color': (0, 0, 255), 'alert': 'CANH BAO: DANG HUT THUOC LA!'},
+            1: {'key': 'eating', 'name': 'AN UONG', 'color': (0, 255, 255), 'alert': 'CANH BAO: AN UONG TRONG GIO TRUC!'},
+            2: {'key': 'sleeping', 'name': 'NGU GAT', 'color': (255, 0, 255), 'alert': 'CANH BAO: NGU GAT TRONG GIO TRUC!'},
+            3: {'key': 'phone', 'name': 'DIEN THOAI', 'color': (0, 165, 255), 'alert': 'CANH BAO: SU DUNG DIEN THOAI!'}
+        }
 
     def is_inside_roi(self, point, polygon):
         if polygon is None or len(polygon) < 3:
@@ -73,74 +77,36 @@ class ProductionGuardMonitor:
         cv2.putText(frame, "CHOT TRUC ROI", (self.roi_polygon[0][0], self.roi_polygon[0][1] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        # 2. SUY LUẬN HÀNH VI VỚI ĐỘ PHÂN GIẢI CHUẨN 640 (ĐỂ BẮT ĐIẾU THUỐC NHỎ)
-        # Hạ conf xuống 0.12 để bắt được cả điếu thuốc từ góc nghiêng / xa
-        behavior_results = self.behavior_model(clean_input, conf=0.12, imgsz=640, verbose=False)[0]
+        # 2. SUY LUẬN HÀNH VI VỚI ĐỘ PHÂN GIẢI CHUẨN 640
+        behavior_results = self.behavior_model(clean_input, conf=0.15, imgsz=640, verbose=False)[0]
 
-        has_smoking_frame = False
-        has_phone_frame = False
-        has_sleeping_frame = False
+        detected_in_this_frame = set()
 
         for box in behavior_results.boxes:
             cls_id = int(box.cls[0].item())
-            cls_name = self.behavior_model.names[cls_id].lower()
             conf = float(box.conf[0].item())
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-            # A. PHÁT HIỆN HÚT THUỐC (Bao gồm nhãn smoking hoặc cử chỉ tay-miệng eating với điếu thuốc)
-            if 'smoke' in cls_name or 'cig' in cls_name:
-                has_smoking_frame = True
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                label_txt = f"HUT THUOC: {conf:.2f}"
-                (wt, ht), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 22), (x1 + wt, y1), (0, 0, 255), -1)
-                cv2.putText(frame, label_txt, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if cls_id in self.behavior_config:
+                cfg = self.behavior_config[cls_id]
+                b_key = cfg['key']
+                b_name = cfg['name']
+                color = cfg['color']
 
-            # B. PHÁT HIỆN ĐIỆN THOẠI
-            elif 'phone' in cls_name:
-                has_phone_frame = True
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 3)
-                label_txt = f"DIEN THOAI: {conf:.2f}"
-                (wt, ht), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 22), (x1 + wt, y1), (0, 165, 255), -1)
-                cv2.putText(frame, label_txt, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # Cập nhật thời điểm nhìn thấy hành vi này
+                self.last_seen_time[b_key] = current_time
+                detected_in_this_frame.add(b_key)
 
-            # C. PHÁT HIỆN NGỦ GẬT
-            elif 'sleep' in cls_name:
-                has_sleeping_frame = True
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
-                label_txt = f"NGU GAT: {conf:.2f}"
-                (wt, ht), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 22), (x1 + wt, y1), (255, 0, 255), -1)
-                cv2.putText(frame, label_txt, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # Vẽ khung viền dày dặn và nhãn nổi bật
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                label_txt = f"{b_name}: {conf:.2f}"
+                (wt, ht), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+                cv2.rectangle(frame, (x1, y1 - 24), (x1 + wt, y1), color, -1)
+                cv2.putText(frame, label_txt, (x1, y1 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0) if b_key == 'eating' else (255, 255, 255), 2)
+                print(f"🚨 [AI PHÁT HIỆN]: {label_txt}")
 
-            # D. ĂN UỐNG / TAY ĐƯA LÊN MIỆNG
-            elif 'eat' in cls_name:
-                # Nếu đưa tay lên miệng, cũng ghi nhận vào hỗ trợ hút thuốc nếu có nghi vấn
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                cv2.putText(frame, f"TAY MIENG: {conf:.2f}", (x1, y1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-
-        # 3. BỘ TÍCH LŨY THỜI GIAN (TEMPORAL VOTING):
-        # Nếu trong 10 frame gần nhất xuất hiện >= 2 lần -> Xác nhận có hành vi vi phạm!
-        self.smoking_history.append(1 if has_smoking_frame else 0)
-        self.phone_history.append(1 if has_phone_frame else 0)
-        self.sleeping_history.append(1 if has_sleeping_frame else 0)
-
-        # Kiểm tra ngưỡng kích hoạt
-        if sum(self.smoking_history) >= 2:
-            self.alert_until['smoking'] = current_time + 3.0  # Giữ cảnh báo 3 giây
-
-        if sum(self.phone_history) >= 2:
-            self.alert_until['phone'] = current_time + 3.0
-
-        if sum(self.sleeping_history) >= 4: # Ngủ cần xuất hiện nhiều frame hơn
-            self.alert_until['sleeping'] = current_time + 3.0
-
-        # 4. QUÉT NGƯỜI TRỰC (1 lần mỗi 4 frame)
+        # 3. QUÉT NGƯỜI TRỰC BẢO VỆ (1 lần mỗi 4 frame để giảm tải CPU)
         if self.frame_count % 4 == 0 or len(self.last_person_boxes) == 0:
             person_results = self.person_model(clean_input, classes=[0], conf=0.30, imgsz=480, verbose=False)[0]
             self.last_person_boxes = []
@@ -160,10 +126,11 @@ class ProductionGuardMonitor:
             else:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 1)
 
-        if has_smoking_frame or has_phone_frame:
+        # Nếu phát hiện bất kỳ hành vi nào thì chắc chắn bảo vệ có mặt
+        if detected_in_this_frame:
             self.guard_in_roi = True
 
-        # 5. XỬ LÝ CẢNH BÁO
+        # 4. XỬ LÝ CẢNH BÁO
         alerts = []
         if self.guard_in_roi:
             self.last_seen_in_post_time = current_time
@@ -178,13 +145,14 @@ class ProductionGuardMonitor:
                 cv2.putText(frame, f"Vang mat: {int(absence_dur)}s (Bao dong sau {rem}s)",
                             (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        # Thêm các cảnh báo đang trong thời gian kích hoạt
-        if current_time < self.alert_until['smoking']:
-            alerts.append("CANH BAO: DANG HUT THUOC LA!")
-        if current_time < self.alert_until['phone']:
-            alerts.append("CANH BAO: SU DUNG DIEN THOAI!")
-        if current_time < self.alert_until['sleeping']:
-            alerts.append("CANH BAO: NGU GAT TRONG GIO TRUC!")
+        # 5. CẢNH BÁO HÀNH VI: TỰ ĐỘNG TẮT SAU 2.0 GIÂY NẾU KHÔNG CÒN HÀNH VI
+        for cls_id, cfg in self.behavior_config.items():
+            b_key = cfg['key']
+            elapsed_since_seen = current_time - self.last_seen_time[b_key]
+            # Nếu hành vi vừa diễn ra trong vòng 2.0s gần nhất -> Hiện cảnh báo
+            # Quá 2.0s không thấy -> Tự động biến mất ngay lập tức!
+            if elapsed_since_seen < self.alert_duration:
+                alerts.append(cfg['alert'])
 
         # 6. VẼ BĂNG RÔN CẢNH BÁO
         y_alert = 75
@@ -212,8 +180,8 @@ def run_production(video_source=0, model_path='best.pt'):
 
     print("\n" + "="*60)
     print("🚀 HE THONG GIAM SAT HANH VI BAO VE (PRODUCTION)")
-    print("-> Do phan giai phan tich: 640x640")
-    print("-> Co che: Temporal Voting (Loc rung lac khung hinh)")
+    print("-> Nhan dien: 1. Hut thuoc  2. Dien thoai  3. Ngu gat  4. An uong")
+    print("-> Chống dính cảnh báo: Tự động tắt sau 2 giây khi hết hành vi")
     print("Nhan 'q' de thoat chuong trinh...")
     print("="*60 + "\n")
 
