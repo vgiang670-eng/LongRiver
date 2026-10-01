@@ -63,7 +63,7 @@ class ProductionGuardMonitor:
             'phone': 0.0,
             'eating': 0.0
         }
-        self.alert_duration = 2.0  # Tắt cảnh báo sau 2s khi hết hành vi
+        self.alert_duration = 1.0  # Tắt cảnh báo sau 1.0s khi hết hành vi
 
         # BỘ ĐẾM THỜI GIAN RIÊNG CHO NGỦ GẬT (Phải gục đầu liên tục > 5s mới báo động)
         self.sleep_start_time = None
@@ -76,9 +76,9 @@ class ProductionGuardMonitor:
 
         # Ngưỡng tin cậy (Confidence) chuẩn hóa để chống báo động giả
         self.conf_thresholds = {
-            0: 0.35,  # Hút thuốc: >= 0.35 (chỉ bắt điếu thuốc thật)
-            1: 0.30,  # Ăn uống: >= 0.30
-            2: 0.40,  # Ngủ gật: nâng lên 0.40 để khi nhìn thẳng/nhìn xuống màn hình không bị nhận nhầm
+            0: 0.35,  # Hút thuốc: >= 0.35
+            1: 0.50,  # Ăn uống: nâng lên 0.50 (tránh nhầm khi đưa tay/cầm điện thoại gần mặt)
+            2: 0.40,  # Ngủ gật: >= 0.40
             3: 0.35   # Điện thoại: >= 0.35
         }
 
@@ -126,21 +126,41 @@ class ProductionGuardMonitor:
 
         detected_in_this_frame = set()
 
+        # Bước 1: Thu thập tất cả các bounding box hợp lệ đạt ngưỡng tin cậy
+        valid_candidates = []
         for box in behavior_results.boxes:
             cls_id = int(box.cls[0].item())
             conf = float(box.conf[0].item())
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-            # BỎ QUA NẾU KHÔNG ĐẠT NGƯỠNG CONFIDENCE CỦA LỚP ĐÓ
             required_conf = self.conf_thresholds.get(cls_id, 0.35)
             if conf < required_conf:
                 continue
 
-            # LỌC BỎ KHUNG HÌNH RÁC QUÁ LỚN: Điếu thuốc không thể to hơn 45% toàn bộ khung hình
+            # Lọc bỏ bounding box rác quá lớn
             box_w = x2 - x1
             box_h = y2 - y1
             if cls_id == 0 and (box_w > w * 0.45 or box_h > h * 0.45):
                 continue
+
+            valid_candidates.append({
+                'cls_id': cls_id,
+                'conf': conf,
+                'box': (x1, y1, x2, y2)
+            })
+
+        # Bước 2: Khử xung đột cử chỉ tay:
+        # Nếu đã phát hiện Điện thoại (cls 3) hoặc Hút thuốc (cls 0) -> LOẠI BỎ hoàn toàn nhãn Ăn uống (cls 1)
+        has_phone_or_smoke = any(c['cls_id'] in (0, 3) for c in valid_candidates)
+        if has_phone_or_smoke:
+            valid_candidates = [c for c in valid_candidates if c['cls_id'] != 1]
+            self.last_seen_time['eating'] = 0.0  # Tắt ngay lập tức mọi cảnh báo ăn uống còn vương lại
+
+        # Bước 3: Vẽ và cập nhật thời điểm nhìn thấy
+        for c in valid_candidates:
+            cls_id = c['cls_id']
+            conf = c['conf']
+            x1, y1, x2, y2 = c['box']
 
             if cls_id in self.behavior_config:
                 cfg = self.behavior_config[cls_id]
